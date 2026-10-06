@@ -1,0 +1,343 @@
+MAGICIAN'S DAY OFF - HOW THE PROGRAM WORKS
+============================================
+This document explains the internal workings of the whole experience: the big
+picture architecture, and then a deep dive into each trick (mirror, real-wall
+alignment, wall breaking, rhythm battle, hand gestures, cat AI). It is a
+companion to SETUP_GUIDE.md, which only tells you WHAT to drag where - this
+file tells you WHY it works and HOW the pieces talk to each other.
+
+Everything described here is plain MonoBehaviour C#, using only the Meta Core
+SDK (OVRCameraRig / OVRHand / OVRSkeleton / passthrough) and, optionally, the
+Mixed Reality Utility Kit (MRUK) for real-wall detection. No XR Interaction
+Toolkit, no third-party rhythm-game asset, no fractured-mesh plugin - every
+"trick" below is a small, self-contained algorithm.
+
+
+1. BIG PICTURE: THE EVENT-DRIVEN STATE MACHINE
+------------------------------------------------
+The whole sequence (mirror -> cat reveal -> wall crack -> wall punch -> forest
+reveal -> rhythm battle -> win/lose) is driven by two scripts that never
+reference each other's private details:
+
+  * GameEvents.cs  - a static class of C# events (OnMirrorBroken,
+    OnWallBroken, OnNoteMissed, OnPlayerWin, OnPlayerLose, etc.). Any script
+    can "raise" one of these (GameEvents.RaiseWallBroken()) and any other
+    script can subscribe to it (GameEvents.OnWallBroken += MyHandler). This
+    is the classic "pub/sub" pattern - it means e.g. CatController does not
+    need a direct reference to RhythmGameManager to know a note was missed;
+    it just listens for GameEvents.OnNoteMissed.
+
+  * GameManager.cs - the actual sequencer. It owns a single coroutine chain
+    (IntroRoutine -> WallCrackRoutine -> RhythmStartRoutine) that waits on
+    fixed/adjustable delays and calls the public "begin" methods on the other
+    systems in order (mirror.BeginSequence(), wallCrackWarning.BeginWarning(),
+    wallBreakController.Arm(), rhythmGame.BeginSong()). It also listens to
+    GameEvents to know when to advance (e.g. it only starts the wall-crack
+    countdown once GameEvents.OnMirrorBroken fires).
+
+Every subsystem below (mirror, wall, rhythm, cat) is intentionally a "dumb"
+component that does ONE job and fires/listens to events - this is what let us
+build 26 small scripts instead of one giant God-object, and it is also why
+you can test each one in isolation in Play Mode.
+
+
+2. THE MIRROR TRICK (how a flat quad "reflects" the player)
+--------------------------------------------------------------
+Quest has no API that gives you a literal "selfie camera" image of the player,
+so the mirror does NOT show a photograph of you. Instead it uses the classic
+real-time planar-mirror-camera technique that almost every mirror in every
+Unity game uses (the same idea as the water-reflection shaders in older
+Unity demos):
+
+  1. MirrorPlaneBuilder.cs procedurally builds a simple double-sided quad
+     mesh (two triangles, built with both possible vertex windings so it is
+     visible from either side - see BuildMesh() in that file) and assigns it
+     to a MeshFilter. This replaces what would otherwise be a manually
+     created "3D Object > Quad" in the Editor.
+
+  2. That quad's MeshRenderer uses Assets/mirror-frame/MIrrorMat.mat, whose
+     _BaseMap is NOT a static texture - it is a RenderTexture asset
+     (Assets/mirror-frame/Mirror.renderTexture). A RenderTexture is a texture
+     that a Camera can render INTO instead of rendering to the headset.
+
+  3. A second Camera (MirrorCamera, a child of MagicBattle_MirrorSystem) has
+     its Target Texture set to that same Mirror.renderTexture. Whatever this
+     camera sees gets drawn onto the texture, which is instantly displayed on
+     the quad's material because they are literally the same texture asset.
+
+  4. MirrorReflectionCamera.cs (attached to MagicBattle_MirrorSystem) runs in
+     LateUpdate and does the actual "reflection" math every frame:
+       - It takes the player's CenterEyeAnchor camera position/forward/up.
+       - It reflects the position across the mirror's plane using the
+         standard point-reflection formula:
+             reflectedPos = playerPos - 2 * dot(playerPos - planePoint, planeNormal) * planeNormal
+       - It reflects the forward and up vectors the same way (mirroring a
+         direction only needs the dot-product term, not the "2x minus" since
+         directions have no origin).
+       - It writes these into MirrorCamera's transform and copies FOV/near/far
+         from the player's camera so the perspective matches exactly.
+     The net effect: MirrorCamera is always sitting exactly where the
+     player's reflection WOULD be standing on the other side of the glass,
+     looking back at them - which is optically identical to what a real
+     mirror does. Because it is a full secondary Camera, it renders the
+     actual 3D scene (your hands, the cat, UI, everything) - not a photo.
+
+  5. The "shatter": MirrorBreakSequence.cs is a timer. After crackDuration
+     seconds it fires OnMirrorCrackStart (optionally swapping in a
+     pre-cracked decal GameObject you provide), waits shatterDelay more
+     seconds, then:
+       - Disables the intact mirror quad (and the crack decal).
+       - Procedurally builds a grid of small quads (shardCountX x
+         shardCountY, see SpawnShards()) sized to tile the mirror's surface,
+         each carrying a slice of the original mirror material's UVs so the
+         shattered pieces still visually look like fragments of what was
+         being reflected a moment ago.
+       - Gives each shard a Rigidbody + BoxCollider and an outward+forward
+         impulse force, so Unity's physics engine does the "fall apart"
+         animation for free - no fractured mesh asset or plugin needed.
+       - Activates the (until-now hidden) cat GameObject and fires
+         OnCatRevealed / OnMirrorBroken.
+     This is why the SETUP_GUIDE never asks you to import a "shattered
+     mirror" 3D model: the shards are generated in code from the SAME single
+     mirror material, at runtime.
+
+
+3. REAL-WORLD WALL ALIGNMENT (the "break the real wall" trick)
+--------------------------------------------------------------
+This is the part that makes the wall feel like it is YOUR actual wall, not a
+virtual box floating in the room. It works through an abstraction interface
+plus two interchangeable implementations:
+
+  IWallLocator.cs (interface)
+    Exposes exactly four things any "wall system" must answer:
+      WallCenter  - a world-space point on the wall
+      WallNormal  - the direction pointing OUT of the wall into the room
+      WallSize    - approximate width/height in metres
+      HasWall     - whether a wall has actually been found yet
+
+  Every other script that needs to know where the wall is (WallCrackWarning,
+  WallBreakController, WallBreakEffect, GameManager) only ever talks to
+  "wallLocatorComponent as IWallLocator" - they never know or care whether
+  that is real room-scan data or a hand-placed marker. This is what lets the
+  whole game run identically in the Unity Editor (no headset, no room scan)
+  and on a real Quest 3 with a scanned room.
+
+  (a) ManualWallLocator.cs - the default, always available.
+      A plain Transform ("wallMarker") that you place by hand (or call
+      CalibrateInFrontOfPlayer() at runtime, which snaps it to a fixed
+      distance directly in front of wherever the player is currently facing,
+      levelled so it stays vertical). Good for testing in the Editor or for
+      quick on-device calibration without a full room scan.
+
+  (b) MRUKWallLocator.cs - the "real wall" implementation, used on-device.
+      This is the Meta Mixed Reality Utility Kit (MRUK) - the same room-scan
+      system Meta's "First Encounters" tech demo uses, and the same data the
+      OS-level Space Setup / Room Scan feature on Quest 3 produces the first
+      time you use passthrough in a space. Quest's Scene API lets your app
+      query that scan as a list of "anchors" (walls, floor, ceiling, desks,
+      doors, windows), each with a real-world position, rotation and
+      (for walls) a rectangular size. Concretely:
+        - MRUK.Instance.RegisterSceneLoadedListener fires once the OS has
+          handed the room data to the app at startup.
+        - room.WallAnchors gives every wall anchor from the player's actual
+          scanned room (the SAME geometry the OS uses to draw its own
+          boundary/furniture warnings).
+        - FindWallBehindPlayer() loops over them and picks the one most
+          "behind" the player: it flattens both the direction-to-anchor and
+          the player's backward vector onto the horizontal plane (zeroing Y)
+          and takes the dot product - the anchor with the highest dot product
+          is most directly behind the player's current facing direction.
+        - It then copies that anchor's transform.position/forward as
+          WallCenter/WallNormal, and best.PlaneRect's width/height as
+          WallSize.
+      Because these numbers come directly from the OS's own room mesh, the
+      hole/crack effects that WallBreakEffect spawns land exactly on the
+      real, physical wall surface the player is standing in front of - the
+      "wall" was never a virtual object at all, only the decals/hole-frame/
+      debris drawn ON TOP of (and, via passthrough, in front of) the real
+      wall are virtual.
+      This script is wrapped in "#if MAGICBATTLE_MRUK / #endif" so the
+      project compiles with or without the MRUK package installed; you only
+      enable it by adding the MAGICBATTLE_MRUK scripting define (see
+      SETUP_GUIDE.md) once you've imported the Room Mesh / MRUK Building
+      Block. Until then, ManualWallLocator quietly does the same job with a
+      hand-placed marker instead of scanned geometry.
+
+  How the "hole" is actually drawn once the wall is punched:
+    WallBreakEffect.Break(locator) does three things, all built procedurally
+    at the wall's real position/rotation returned by the locator:
+      1. ProceduralHoleFrameMesh.Build(wallSize, holeSize, offset) generates
+         a flat "picture frame" mesh: a rectangle the size of the wall with a
+         rectangular hole cut out of the middle (built from 8 vertices and
+         fan-triangulated border segments). This frame is given an opaque
+         material (frameMaterial) so it VISUALLY reads as "the wall, but
+         with a hole" when seen through/with passthrough - the real wall
+         behind the hole is where the forest shows up (see below), while the
+         frame still occludes passthrough around the opening.
+      2. SpawnDebris() instantiates small cube primitives around the
+         hole's edge, gives them Rigidbodies and random impulses/torques, so
+         they tumble outward and to the floor using normal Unity physics -
+         same "free" physics trick as the mirror shards.
+      3. RevealForest() moves/activates a ForestEnvironmentBuilder instance
+         positioned forestDistanceBehindWall metres along the wall's own
+         normal direction (i.e. further INTO the room, where the real wall
+         can't actually see, since it's behind passthrough's solid wall
+         render) - practically, because passthrough shows the real wall as
+         opaque but our hole-frame mesh + forest are virtual geometry that
+         gets composited in front of/within the cut-out, the player perceives
+         "looking through the hole into the forest" even though the forest
+         content is just normal opaque 3D geometry placed a couple of metres
+         behind the (virtual) hole frame, inside the real wall's volume.
+
+  How the punch itself is detected (WallBreakController.cs):
+    Every frame (while "armed", i.e. after the crack-warning countdown has
+    finished), it checks both hands via HandGestureRecognizer:
+      - The hand's CurrentGesture must currently be GestureType.Fist.
+      - Its WristVelocity magnitude (metres/second, computed by finite-
+        differencing the wrist position between frames - see
+        HandGestureRecognizer.Update()) must exceed punchSpeedThreshold.
+      - The wrist's perpendicular distance to the wall PLANE (dot product of
+        (wallCenter - wristPosition) with wallNormal) must be within
+        punchRange metres - i.e. the fist is actually near the wall, not
+        thrown randomly in open air far away.
+      - The hand's velocity direction, dotted with the wall's normal, must
+        exceed aimDotThreshold - i.e. the player is actually punching INTO
+        the wall, not just moving their hand past it sideways.
+    If all four conditions hold for either hand, TriggerBreak() fires once
+    (a "_broken" bool latches it) and calls WallBreakEffect.Break(locator)
+    using the same IWallLocator the rest of the system already agreed on.
+
+
+4. HAND GESTURE RECOGNITION (no Interaction SDK, no pose assets)
+--------------------------------------------------------------
+HandGestureRecognizer.cs sits directly on top of Meta's lowest-level hand
+tracking components, OVRHand and OVRSkeleton (both come from Meta Core SDK's
+"Hand Tracking" Building Block - no Interaction SDK needed):
+
+  - Every frame it reads the live bone transforms from OVRSkeleton.Bones:
+    the wrist root, the middle-finger knuckle (Hand_Middle1), and all five
+    fingertips.
+  - "Extended" is computed per-finger as:
+        normalisedDistance = distance(wrist, fingertip) / distance(wrist, knuckle)
+    i.e. the tip-to-wrist distance is normalised by the wrist-to-knuckle
+    distance of THAT SAME HAND. This makes the "is this finger out or
+    curled" threshold automatically scale with the user's actual hand size
+    and the current tracking distance/scale, instead of using a fixed
+    centimetre threshold that would behave differently for small vs large
+    hands.
+  - Classify() then turns the five booleans into a GestureType enum purely
+    by counting/pattern-matching (0 extended = Fist, 4+ extended = OpenPalm,
+    only index = Point, index+middle = Peace, only thumb = ThumbsUp).
+  - WristVelocity is just (currentWristPos - previousWristPos) / deltaTime,
+    cached every frame - this single value is reused both for the wall-punch
+    speed check (section 3) and is available for any other "swing" based
+    mechanic.
+  - ColorForGesture() maps each gesture to a fixed colour, which is what
+    tints the rhythm-game note orbs (section 5) so the player can visually
+    tell which gesture a given note wants before it even arrives.
+
+This whole script is ~140 lines and has zero dependencies beyond OVRHand/
+OVRSkeleton, which is why the project works with just the Meta Core SDK
+package and does not need Interaction SDK's pose-detection system.
+
+
+5. THE RHYTHM BATTLE (the "Beat Saber-lite" part)
+--------------------------------------------------------------
+Data model:
+  - NoteData.cs is a plain serializable struct: a time (seconds from the
+    start of the "song") and a requiredGesture (GestureType).
+  - BeatMap.cs holds an array of NoteData plus a single travelTime (how many
+    seconds a note takes to fly from its spawn point to the hit zone) and is
+    a ScriptableObject asset, so you can author multiple beat maps as data
+    files without touching code (an Editor menu item generates a default one
+    - see SETUP_GUIDE.md section 4).
+
+Runtime flow (RhythmGameManager.cs):
+  - BeginSong() starts a coroutine that walks the beatMap's notes in order.
+    For each note it waits until (songStartTime + note.time - travelTime)
+    before spawning it - i.e. notes are spawned travelTime seconds BEFORE
+    their nominal hit time, so they visually arrive at the hit zone exactly
+    on the beat.
+  - SpawnNote() instantiates noteOrbPrefab, attaches/reuses a
+    NoteController, and calls Launch(spawnPoint, hitZonePoint + a bit of
+    overshoot, requiredGesture, travelTime, this).
+  - NoteController.Update() lerps the orb's position from start to end over
+    travelTime seconds (Vector3.LerpUnclamped, so it keeps going past the
+    hit zone if never hit - this is what lets a note be "missed" rather than
+    just stopping at the zone). It also tints itself using
+    HandGestureRecognizer.ColorForGesture(requiredGesture) via a
+    MaterialPropertyBlock (so every orb can share one material/prefab
+    without allocating a new material instance per note).
+  - HitZone.cs is a trigger collider placed at the hit zone; its
+    OnTriggerEnter/Exit simply call note.OnEnterHitZone()/OnExitHitZone(),
+    toggling the note's "_inZone" flag.
+  - While _inZone is true, NoteController checks every frame whether
+    manager.PlayerIsPerforming(requiredGesture) is true (i.e. either hand's
+    HandGestureRecognizer.CurrentGesture currently equals the note's
+    requiredGesture). The FIRST frame this matches while inside the zone,
+    the note resolves as a hit immediately (so you don't have to frame-
+    perfectly time anything beyond "already be holding the right gesture
+    when the orb arrives", exactly like Beat Saber's generous timing
+    window). If the orb reaches t>=1 (fully past the hit zone) without ever
+    matching, it resolves as a miss.
+  - NotifyHit/NotifyMiss update Score/Misses and fire GameEvents.OnNoteHit /
+    OnNoteMissed(misses, maxMisses). Once Misses reaches maxMisses (default
+    20, matches the user's "loss after ~20 misses" spec), the coroutine is
+    stopped, all remaining live notes are destroyed, and
+    GameEvents.RaisePlayerLose() fires. If the coroutine runs out of notes
+    first without that happening, RaisePlayerWin() fires instead.
+
+The cat's advance (CatController.cs) is driven purely by listening to the
+SAME OnNoteMissed event: on every miss it does
+    t = misses / maxMisses (clamped 0..1)
+    position = Lerp(forestStartPosition, playerPosition, t)
+so the cat is guaranteed to arrive exactly at the player's position on
+miss number maxMisses - this is why CatController.maxMisses must be kept in
+sync with RhythmGameManager.maxMisses (GameManager/the event payload keeps
+them in sync automatically; see HandleNoteMissed(int misses, int
+configuredMax) overwriting maxMisses on every event in case you only ever
+set it in one place).
+
+
+6. WHY SCRIPTS BUILD THEIR OWN GEOMETRY AT RUNTIME
+--------------------------------------------------------------
+Several systems (MirrorPlaneBuilder, the mirror shards, the wall frame/
+debris, HUDController's Canvas/UI, CatPlaceholderBuilder, 
+ForestEnvironmentBuilder) generate their own meshes/GameObjects/UI in code
+(Awake/OnEnable/BuildIfNeeded) rather than requiring you to build them by
+hand in the Editor. This was a deliberate choice driven by the user's
+request to minimise manual Unity setup: every one of these "auto-builders"
+checks first whether you've already dragged in a real asset (e.g.
+CatPlaceholderBuilder looks for an existing child Renderer; HUDController
+only builds if its public fields are left empty) and skips its own
+placeholder generation if you have - so dragging in real models/audio/
+materials always takes priority, and the placeholders exist purely so the
+scene is already fully playable/testable before you've sourced any final
+art or audio.
+
+
+7. QUICK REFERENCE: EVENT FLOW SUMMARY
+--------------------------------------------------------------
+Start
+  -> GameManager.IntroRoutine waits introDuration, calls mirror.BeginSequence()
+MirrorBreakSequence
+  -> waits crackDuration, fires OnMirrorCrackStart, plays crack visual/audio
+  -> waits shatterDelay, shatters mirror, activates cat, fires
+     OnCatRevealed + OnMirrorBroken
+GameManager.HandleMirrorBroken (listens OnMirrorBroken)
+  -> waits postMirrorDelay, positions+starts wallCrackWarning.BeginWarning()
+  -> waits wallCrackWarmup, calls wallBreakController.Arm()
+WallBreakController (armed, polling both hands every frame)
+  -> detects fist-punch aimed at the real/marked wall -> breakEffect.Break()
+     -> fires OnWallBroken
+GameManager.HandleWallBroken (listens OnWallBroken)
+  -> stops wall-crack warning, waits postWallDelay, calls
+     rhythmGame.BeginSong() + cat.PlayCastAnimation()
+RhythmGameManager
+  -> spawns/resolves notes, fires OnNoteHit / OnNoteMissed per note
+CatController (listens OnNoteMissed)
+  -> steps closer proportionally to misses/maxMisses
+RhythmGameManager (when finished or maxMisses reached)
+  -> fires OnPlayerWin or OnPlayerLose
+GameManager.HandleGameOver (listens both) / HUDController (listens both)
+  -> shows the corresponding end-of-game panel
