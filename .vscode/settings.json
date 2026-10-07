@@ -67,6 +67,6 @@
         "*.sln": "*.csproj",
         "*.slnx": "*.csproj"
     },
-    "dotnet.defaultSolution": "Magicians-Day-Off.slnx",
+    "dotnet.defaultSolution": "Magician's Day Off.slnx",
     "dotnet.enableWorkspaceBasedDevelopment": false
 }

@@ -22,6 +22,8 @@ public class HandGestureRecognizer : MonoBehaviour
     /// <summary>World-space position of the wrist, useful for aiming/punch checks.</summary>
     public Vector3 WristPosition { get; private set; }
     public Vector3 WristVelocity { get; private set; }
+    /// <summary>World-space position of the index fingertip (valid while IsTracked), used for aiming.</summary>
+    public Vector3 IndexTipPosition { get; private set; }
 
     OVRHand _hand;
     OVRSkeleton _skeleton;
@@ -53,6 +55,7 @@ public class HandGestureRecognizer : MonoBehaviour
         }
 
         WristPosition = wrist;
+        IndexTipPosition = indexTip;
 
         float dt = Time.deltaTime;
         if (_hasPreviousPosition && dt > 0f)

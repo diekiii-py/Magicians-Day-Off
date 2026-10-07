@@ -16,6 +16,13 @@ public class RigController : MonoBehaviour
 
     void LateUpdate()
     {
+        if (vrCamera == null)
+        {
+            var rig = FindFirstObjectByType<OVRCameraRig>();
+            if (rig != null) vrCamera = rig.centerEyeAnchor;
+            if (vrCamera == null) return;
+        }
+
         // headtracking
         kyleRig.position += (headIKTarget.position - headBone.position);
         kyleRig.rotation = Quaternion.Euler(0f, vrCamera.rotation.eulerAngles.y, 0f);
